@@ -1,0 +1,52 @@
+#!/bin/bash
+# ParseHub Automated Workflow Script
+# This runs the complete pipeline with proper data capture
+
+echo "🚀 ParseHub Automated Workflow"
+echo "=============================="
+echo ""
+
+# Step 1: Fetch projects
+echo "Step 1: Fetching projects..."
+python fetch_projects.py
+echo ""
+
+# Step 2: Run all projects
+echo "Step 2: Starting all projects..."
+python run_projects.py
+echo ""
+
+# Step 3: Monitor with FAST polling (catches data before purging)
+echo "Step 3: Monitoring projects (fast mode - 10s intervals)..."
+echo "⚠️  This is CRITICAL - data expires in ~30 mins!"
+echo "Polling every 10 seconds to capture data before purging..."
+echo ""
+python monitor_fast.py
+echo ""
+
+# Step 4: Generate summary
+echo "Step 4: Generating summary..."
+python -c "
+import json
+from pathlib import Path
+
+results = json.load(open('monitoring_results.json'))
+print('=' * 70)
+print('📊 FINAL SUMMARY')
+print('=' * 70)
+print(f'Projects Run: {results[\"total_projects\"]}')
+print(f'Data Saved: {results.get(\"data_saved_count\", 0)}')
+print(f'Data Purged: {results.get(\"data_purged_count\", 0)}')
+print(f'Failed: {results.get(\"failed_count\", 0)}')
+print()
+print('💾 Saved Files:')
+for project in results['project_data']:
+    if 'data_file' in project:
+        print(f'  ✅ {project[\"project\"]}: {project[\"data_file\"]}')
+    else:
+        print(f'  ⚠️  {project[\"project\"]}: Data purged')
+print('=' * 70)
+"
+
+echo ""
+echo "✅ Workflow complete!"

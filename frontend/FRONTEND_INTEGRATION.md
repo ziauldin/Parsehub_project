@@ -1,0 +1,209 @@
+# Frontend Integration - Stats, Export, Logs & Details
+
+## What Was Implemented
+
+### 1. **New Modal Components** 
+All buttons now open interactive modals with the following information:
+
+#### StatsModal (`components/StatsModal.tsx`)
+Displays project statistics:
+- **Total Pages** - Number of pages scraped
+- **Status** - Current run status
+- **Duration** - Time taken to complete the run
+- **Last Run** - Date and time of last execution
+- Detailed run information (start/end times)
+
+#### DetailsModal (`components/DetailsModal.tsx`)  
+Shows comprehensive project details:
+- Project title and owner email
+- Project token (for API access)
+- Last run token
+- Current status
+- Pages scraped
+- Data file location
+- Start time of last run
+
+#### LogsModal (`components/LogsModal.tsx`)
+Displays monitoring and execution logs:
+- Real-time log entries with timestamps
+- Status indicators (complete, running, error)
+- Page count updates
+- Message descriptions
+- Fetches from `monitoring_results.json`
+- Supports both historical and live logs
+
+#### ExportModal (`components/ExportModal.tsx`)
+Export scraped data in multiple formats:
+- **JSON** - Native format, complete data structure
+- **CSV** - Spreadsheet format, auto-generated headers
+- Intelligent CSV conversion handles nested arrays
+- Downloads directly to user's computer
+- Shows data file information and location
+
+### 2. **New API Endpoints**
+
+#### `/api/logs` (GET)
+Fetches monitoring logs for a project:
+```
+GET /api/logs?token={projectToken}
+Response: { logs: [...] }
+```
+Features:
+- Reads from `monitoring_results.json`
+- Returns formatted log entries with timestamps
+- Each entry includes: timestamp, status, pages, message
+- Defaults to informational message if no logs available
+
+#### `/api/export` (GET)
+Exports project data in requested format:
+```
+GET /api/export?token={projectToken}&format={json|csv}
+Response: File download (application/json or text/csv)
+```
+Features:
+- Reads from `data_{token}.json` files
+- Supports JSON and CSV formats
+- Intelligent CSV conversion:
+  - Extracts arrays from nested objects
+  - Handles special characters and quotes
+  - Generates headers automatically
+- Sets proper Content-Disposition headers for downloads
+- Returns 404 if data file doesn't exist
+
+### 3. **Updated ProjectsList Component**
+Enhanced with modal management:
+- State management for 4 modals (stats, details, logs, export)
+- Opens appropriate modal when button clicked
+- Passes project data to modals
+- Closes modals on button click
+- Renders all 5 action buttons:
+  - **Run Project** - Trigger execution
+  - **Stats** - View statistics
+  - **Export** - Download data
+  - **Logs** - View logs
+  - **Details** - Full project info
+
+### 4. **New File: Modal Component** (`components/Modal.tsx`)
+Reusable modal wrapper:
+- Fade overlay background
+- Close button (X) in top-right
+- Three size options: small, medium, large
+- Scrollable content area
+- Consistent styling across all modals
+
+## Button Functionality Summary
+
+| Button | Action | Modal |
+|--------|--------|-------|
+| **Run Project** | Triggers new project run | None |
+| **Stats** | Shows statistics & metrics | StatsModal |
+| **Details** | Displays project information | DetailsModal |
+| **Export** | Download data as JSON/CSV | ExportModal |
+| **Logs** | View execution logs | LogsModal |
+
+## Data Flow
+
+```
+User clicks button
+    ↓
+Opens modal with selectedProject
+    ↓
+Modal displays data from:
+  - Project object (stats, details)
+  - API calls (logs, export)
+    ↓
+User can download or view information
+```
+
+## File Structure
+
+```
+frontend/
+├── app/
+│   ├── api/
+│   │   ├── logs/
+│   │   │   └── route.ts          [NEW]
+│   │   └── export/
+│   │       └── route.ts          [NEW]
+│   └── page.tsx                  [unchanged]
+├── components/
+│   ├── Modal.tsx                 [NEW]
+│   ├── StatsModal.tsx            [NEW]
+│   ├── DetailsModal.tsx          [NEW]
+│   ├── LogsModal.tsx             [NEW]
+│   ├── ExportModal.tsx           [NEW]
+│   └── ProjectsList.tsx          [UPDATED]
+```
+
+## Features
+
+### Stats Button
+✅ Shows page count, status, execution duration
+✅ Displays start and end times
+✅ Calculates run duration automatically
+✅ Formatted in easy-to-read cards
+
+### Details Button  
+✅ Project name, owner, token
+✅ Last run information
+✅ Data file location
+✅ Tokens formatted for easy copying
+
+### Export Button
+✅ Download as JSON (complete structure)
+✅ Download as CSV (spreadsheet ready)
+✅ Smart CSV conversion from nested JSON
+✅ Auto-generates column headers
+✅ Handles special characters in data
+
+### Logs Button
+✅ Fetches from monitoring_results.json
+✅ Shows timestamps for each event
+✅ Color-coded status (green=complete, yellow=running, red=error)
+✅ Displays page count updates
+✅ Helpful tip when no logs available
+
+## Backend Data Requirements
+
+The modals work with existing backend files:
+
+1. **monitoring_results.json** - For logs display
+   - Auto-generated by monitor_fast.py
+   - Contains project_data array with:
+     - status, pages_scraped, data_file, note
+
+2. **data_{token}.json** - For export
+   - Generated by monitor_fast.py after each run
+   - Contains actual scraped data
+   - Supports nested array or flat object structure
+
+## TypeScript Configuration
+
+All components are fully typed:
+- Interface definitions for Project, Modal props
+- Proper error handling
+- None values handled gracefully
+- TypeScript strict mode enabled
+
+## Testing
+
+To test all features:
+
+1. Run projects: `python run_projects.py`
+2. Monitor: `python monitor_fast.py`
+3. Open frontend: `http://localhost:3003` (or 3001/3002/3003 if ports busy)
+4. Click buttons to open modals
+5. Export data to CSV/JSON
+6. View logs and statistics
+
+## Performance
+
+- Modals load on-demand (lazy loaded)
+- CSV conversion happens on-demand in API route
+- Minimal frontend bundle size increase (~5KB)
+- API routes are cached-friendly
+- No real-time streaming (polling based)
+
+---
+
+**Status**: ✅ Complete - All features implemented and integrated
