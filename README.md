@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ParseHub - Web Scraping Dashboard
 
 A full-stack web scraping dashboard for ParseHub API integration with a Next.js frontend and Python backend.
@@ -167,3 +168,6 @@ For issues or questions, refer to:
 ---
 
 **Last Updated**: February 16, 2026
+=======
+# Parsehub_project
+>>>>>>> aa889f4d60a91749dd880b57970c47f8c0f7f659
