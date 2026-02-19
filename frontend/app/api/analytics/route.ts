@@ -77,6 +77,20 @@ async function storeAnalyticsDataToDB(
     }
 
     // Create a temporary JSON file with the data to store
+    // Custom replacer to handle non-serializable objects
+    const jsonReplacer = (key: any, value: any) => {
+      if (value instanceof Date) {
+        return value.toISOString()
+      }
+      if (typeof value === 'function') {
+        return undefined
+      }
+      if (typeof value === 'bigint') {
+        return value.toString()
+      }
+      return value
+    }
+
     const dataToStore = {
       project_token: projectToken,
       run_token: runToken,
@@ -87,45 +101,107 @@ async function storeAnalyticsDataToDB(
 
     const tempFile = path.join(backendDir, `.analytics_temp_${projectToken}_${Date.now()}.json`)
     console.log(`[DB STORE] Writing temp file: ${tempFile}`)
-    fs.writeFileSync(tempFile, JSON.stringify(dataToStore))
-    console.log(`[DB STORE] Temp file written: ${fs.existsSync(tempFile) ? 'verified' : 'FAILED'}`)
+    
+    try {
+      const jsonString = JSON.stringify(dataToStore, jsonReplacer)
+      if (!jsonString || jsonString.length === 0) {
+        throw new Error('JSON serialization produced empty output')
+      }
+      fs.writeFileSync(tempFile, jsonString)
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e)
+      console.error(`[DB STORE] JSON serialization error: ${errMsg}`)
+      throw e
+    }
+    
+    const fileExists = fs.existsSync(tempFile)
+    const fileSize = fileExists ? fs.statSync(tempFile).size : 0
+    console.log(`[DB STORE] Temp file written: ${fileExists ? `verified (${fileSize} bytes)` : 'FAILED'}`)
 
     try {
       const pythonScript = `
 import sys
 import json
+import os
+
 sys.path.insert(0, '.')
 from database import ParseHubDatabase
 
-try:
-    print("[PYTHON] Starting store_analytics_data...", file=sys.stderr)
-    with open(r'${tempFile}', 'r') as f:
-        data = json.load(f)
+def main():
+    try:
+        # Get file path from command line argument
+        if len(sys.argv) < 2:
+            raise ValueError("No temp file path provided")
+        
+        temp_file = sys.argv[1]
+        
+        # Validate file exists and has content
+        if not os.path.exists(temp_file):
+            raise FileNotFoundError(f"Temp file not found: {temp_file}")
+        
+        file_size = os.path.getsize(temp_file)
+        if file_size == 0:
+            raise ValueError(f"Temp file is empty: {temp_file}")
+        
+        print(f"[PYTHON] Reading temp file: {temp_file} ({file_size} bytes)", file=sys.stderr)
+        
+        # Read and parse JSON with error handling
+        try:
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                if not content.strip():
+                    raise ValueError("File content is empty")
+                data = json.loads(content)
+        except json.JSONDecodeError as je:
+            raise ValueError(f"JSON decode error: {str(je)}")
+        
+        print(f"[PYTHON] Loaded data with {len(data.get('records', []))} records", file=sys.stderr)
+        
+        # Store to database
+        db = ParseHubDatabase()
+        try:
+            result = db.store_analytics_data(
+                data['project_token'],
+                data['run_token'],
+                data['analytics_data'],
+                data['records'],
+                data.get('csv_data')
+            )
+            
+            print(f"[PYTHON] Store result: {result}", file=sys.stderr)
+            
+            if result:
+                print(json.dumps({
+                    "success": True,
+                    "message": "Data stored successfully",
+                    "records_stored": len(data.get('records', []))
+                }))
+            else:
+                print(json.dumps({
+                    "success": False,
+                    "error": "Database storage returned False"
+                }))
+        finally:
+            db.disconnect()
     
-    print(f"[PYTHON] Loaded data with {len(data.get('records', []))} records", file=sys.stderr)
-    
-    db = ParseHubDatabase()
-    result = db.store_analytics_data(
-        data['project_token'],
-        data['run_token'],
-        data['analytics_data'],
-        data['records'],
-        data['csv_data']
-    )
-    
-    print(f"[PYTHON] Store result: {result}", file=sys.stderr)
-    db.disconnect()
-    print(json.dumps({"success": True, "message": "Data stored successfully", "records_stored": len(data.get('records', []))}))
-except Exception as e:
-    import traceback
-    print(f"[PYTHON] ERROR: {str(e)}", file=sys.stderr)
-    print(traceback.format_exc(), file=sys.stderr)
-    print(json.dumps({"success": False, "error": str(e)}))
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"[PYTHON] ERROR: {error_msg}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        print(json.dumps({
+            "success": False,
+            "error": error_msg
+        }))
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
 `
 
-      console.log(`[DB STORE] Executing Python script...`)
+      console.log(`[DB STORE] Executing Python script with file: ${tempFile}...`)
       const output = execSync(
-        `"${pythonExe}" -c "${pythonScript.replace(/"/g, '\\"')}"`,
+        `"${pythonExe}" -c "${pythonScript.replace(/"/g, '\\"')}" "${tempFile}"`,
         {
           cwd: backendDir,
           encoding: 'utf-8',
@@ -135,8 +211,18 @@ except Exception as e:
         }
       )
 
+      if (!output || output.trim().length === 0) {
+        throw new Error('Python script produced no output')
+      }
+
       console.log(`[DB STORE] Python output: ${output}`)
-      const result = JSON.parse(output)
+      let result
+      try {
+        result = JSON.parse(output)
+      } catch (e) {
+        console.error(`[DB STORE] Failed to parse Python output as JSON: ${output}`)
+        throw new Error(`Invalid JSON from Python: ${output.substring(0, 100)}`)
+      }
       
       if (result.success) {
         console.log(`✅ [DB STORE] SUCCESS: Data stored for ${projectToken}, records: ${result.records_stored}`)
@@ -196,28 +282,49 @@ import json
 sys.path.insert(0, '.')
 from database import ParseHubDatabase
 
-try:
-    print("[PYTHON] Getting analytics data...", file=sys.stderr)
-    db = ParseHubDatabase()
-    result = db.get_analytics_data('${projectToken}')
-    db.disconnect()
+def main():
+    try:
+        # Get project token from command line argument
+        if len(sys.argv) < 2:
+            raise ValueError("No project token provided")
+        
+        project_token = sys.argv[1]
+        print(f"[PYTHON] Getting analytics data for {project_token}...", file=sys.stderr)
+        
+        db = ParseHubDatabase()
+        try:
+            result = db.get_analytics_data(project_token)
+            
+            if result:
+                records_count = len(result.get('raw_data', []))
+                print(f"[PYTHON] Found data with {records_count} records", file=sys.stderr)
+                # Convert datetime objects to strings for JSON serialization
+                import datetime
+                def default_handler(obj):
+                    if isinstance(obj, datetime.datetime):
+                        return obj.isoformat()
+                    return str(obj)
+                print(json.dumps(result, default=default_handler))
+            else:
+                print(f"[PYTHON] No data found in database for {project_token}", file=sys.stderr)
+                print(json.dumps({"found": False}))
+        finally:
+            db.disconnect()
     
-    if result:
-        records_count = len(result.get('raw_data', []))
-        print(f"[PYTHON] Found data with {records_count} records", file=sys.stderr)
-        print(json.dumps(result))
-    else:
-        print("[PYTHON] No data found in database", file=sys.stderr)
-        print(json.dumps({"found": False}))
-except Exception as e:
-    import traceback
-    print(f"[PYTHON] ERROR: {str(e)}", file=sys.stderr)
-    print(traceback.format_exc(), file=sys.stderr)
-    print(json.dumps({"found": False, "error": str(e)}))
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"[PYTHON] ERROR: {error_msg}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        print(json.dumps({"found": False, "error": error_msg}))
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
 `
 
     const output = execSync(
-      `"${pythonExe}" -c "${pythonScript.replace(/"/g, '\\"')}"`,
+      `"${pythonExe}" -c "${pythonScript.replace(/"/g, '\\"')}" "${projectToken}"`,
       {
         cwd: backendDir,
         encoding: 'utf-8',
@@ -227,7 +334,18 @@ except Exception as e:
       }
     )
 
-    const result = JSON.parse(output)
+    if (!output || output.trim().length === 0) {
+      console.log(`[DB RETRIEVE] No output from Python script`)
+      return null
+    }
+
+    let result
+    try {
+      result = JSON.parse(output)
+    } catch (e) {
+      console.error(`[DB RETRIEVE] Failed to parse output as JSON: ${output}`)
+      return null
+    }
     
     if (result.found === false) {
       console.log(`[DB RETRIEVE] No cached data found for ${projectToken}`)

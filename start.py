@@ -13,7 +13,9 @@ import sys
 import subprocess
 import argparse
 import platform
+import time
 from pathlib import Path
+import threading
 
 class ParseHubStarter:
     def __init__(self):
@@ -22,6 +24,7 @@ class ParseHubStarter:
         self.backend_dir = self.root_dir / "backend"
         self.venv_dir = self.root_dir / ".venv"
         self.platform = platform.system()
+        self.backend_process = None
         
     def print_header(self):
         print("\n" + "="*60)
@@ -73,6 +76,66 @@ class ParseHubStarter:
             print("⚠️  backend/.env not found\n")
             return False
     
+    def start_backend(self):
+        """Start the Flask backend development server"""
+        print("🐍 Starting Backend Flask Server...")
+        print("   Server will be available at: http://localhost:5000\n")
+        
+        try:
+            if self.platform == "Windows":
+                # On Windows, run python directly from venv
+                python_exe = self.venv_dir / "Scripts" / "python.exe"
+                if not python_exe.exists():
+                    print(f"❌ Python executable not found at: {python_exe}")
+                    return False
+                
+                # Start Flask API server in background
+                self.backend_process = subprocess.Popen(
+                    [str(python_exe), "api_server.py"],
+                    cwd=str(self.backend_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE  # Opens new console window
+                )
+                print("▶️  Flask server started in new console window")
+                time.sleep(3)  # Give server more time to start
+                
+                # Check if process is still alive
+                if self.backend_process.poll() is None:
+                    print("✅ Backend server is running")
+                    return True
+                else:
+                    print("❌ Backend server failed to start")
+                    return False
+            else:
+                # On Linux/Mac
+                python_exe = self.venv_dir / "bin" / "python"
+                if not python_exe.exists():
+                    print(f"❌ Python executable not found at: {python_exe}")
+                    return False
+                
+                self.backend_process = subprocess.Popen(
+                    [str(python_exe), "api_server.py"],
+                    cwd=str(self.backend_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True
+                )
+                print("▶️  Flask server started in background")
+                time.sleep(3)  # Give server more time to start
+                
+                # Check if process is still alive
+                if self.backend_process.poll() is None:
+                    print("✅ Backend server is running")
+                    return True
+                else:
+                    print("❌ Backend server failed to start")
+                    return False
+        except Exception as e:
+            print(f"❌ Error starting backend: {e}")
+            return False
+    
     def start_frontend(self):
         """Start the frontend development server"""
         print("🚀 Starting Frontend Development Server...")
@@ -96,15 +159,19 @@ class ParseHubStarter:
                 )
         except KeyboardInterrupt:
             print("\n\n✋ Shutting down ParseHub...")
+            # Clean up backend process if running
+            if self.backend_process:
+                try:
+                    if self.platform == "Windows":
+                        os.system(f"taskkill /F /PID {self.backend_process.pid}")
+                    else:
+                        self.backend_process.terminate()
+                except:
+                    pass
             sys.exit(0)
         except Exception as e:
             print(f"❌ Error starting frontend: {e}")
             sys.exit(1)
-    
-    def start_backend(self):
-        """Start backend Python services (if configured)"""
-        print("🐍 Backend services would start here if configured")
-        print("   (Optional: Custom Python services)")
     
     def run(self, include_backend=False):
         """Run the startup sequence"""
@@ -114,9 +181,16 @@ class ParseHubStarter:
         if not self.check_frontend():
             sys.exit(1)
         
-        # Check backend (optional)
+        # Start backend (optional)
         if include_backend:
-            self.check_backend()
+            if not self.check_backend():
+                print("⚠️  Skipping backend startup")
+            else:
+                print("-" * 60 + "\n")
+                if not self.start_backend():
+                    print("⚠️  Backend failed to start, continuing with frontend only")
+                else:
+                    print("-" * 60 + "\n")
         
         # Start frontend (this blocks)
         self.start_frontend()

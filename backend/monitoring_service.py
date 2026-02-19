@@ -10,13 +10,27 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from database import ParseHubDatabase
-from recovery_service import RecoveryService
 import os
 from dotenv import load_dotenv
 import logging
 
 load_dotenv()
+
+# Dynamic import handling
+import sys
+from pathlib import Path
+root_dir = Path(__file__).parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+
+try:
+    from backend.database import ParseHubDatabase
+    from backend.recovery_service import RecoveryService
+    from backend.auto_runner_service import AutoRunnerService
+except ImportError:
+    from database import ParseHubDatabase
+    from recovery_service import RecoveryService
+    from auto_runner_service import AutoRunnerService
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +41,7 @@ class MonitoringService:
     def __init__(self):
         self.db = ParseHubDatabase()
         self.recovery_service = RecoveryService()
+        self.auto_runner = AutoRunnerService()
         self.scheduler = BackgroundScheduler()
         self.api_key = os.getenv('PARSEHUB_API_KEY', '')
         self.base_url = os.getenv('PARSEHUB_BASE_URL', 'https://www.parsehub.com/api/v2')
@@ -171,6 +186,132 @@ class MonitoringService:
             del self.recovery_attempts[project_token]
             logger.info(f"Reset recovery counter for {project_token}")
 
+    # ==================== METADATA COMPLETION HANDLING ====================
+
+    def _handle_metadata_completion(self, project_id: int, run_token: str, 
+                                   pages_scraped: int = None, csv_data: str = None) -> Dict:
+        """
+        Handle metadata completion after a run finishes successfully
+        
+        Args:
+            project_id: Database project ID
+            run_token: ParseHub run token
+            pages_scraped: Number of pages scraped in this run
+            csv_data: CSV data from the run (optional, for record counting)
+            
+        Returns:
+            Dictionary with completion handling status
+        """
+        try:
+            # Find metadata record(s) associated with this project
+            conn = self.db.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, personal_project_id, project_name, total_pages, current_page_scraped
+                FROM metadata 
+                WHERE project_id = ?
+                ORDER BY updated_date DESC
+                LIMIT 1
+            ''', (project_id,))
+            
+            metadata = cursor.fetchone()
+            self.db.disconnect()
+            
+            if not metadata:
+                logger.debug(f"No metadata found for project_id {project_id}")
+                return {
+                    'success': False,
+                    'reason': 'No associated metadata',
+                    'project_id': project_id
+                }
+            
+            metadata_id = metadata['id']
+            logger.info(f"📊 Handling metadata completion for record {metadata_id} ({metadata['project_name']})")
+            
+            # Update metadata with run progress
+            update_res = self.auto_runner.update_metadata_after_run(
+                metadata_id,
+                csv_data=csv_data,
+                pages_scraped=pages_scraped
+            )
+            
+            if not update_res['success']:
+                logger.error(f"Failed to update metadata: {update_res['error']}")
+                return {
+                    'success': False,
+                    'error': update_res['error'],
+                    'metadata_id': metadata_id
+                }
+            
+            # Check if scraping is complete
+            completion_res = self.auto_runner.check_scraping_completion(metadata_id)
+            
+            if completion_res['success'] and completion_res['is_complete']:
+                logger.info(f"✅ Scraping complete! Triggering analytics for {metadata['project_name']}")
+                
+                # Trigger analytics
+                analytics_res = self._trigger_metadata_analytics(metadata_id)
+                
+                return {
+                    'success': True,
+                    'status': 'complete',
+                    'message': f"Scraping complete for {metadata['project_name']}",
+                    'metadata_id': metadata_id,
+                    'analytics_triggered': analytics_res.get('success', False)
+                }
+            else:
+                # Not yet complete - inform that more runs are needed
+                remaining = completion_res.get('remaining_pages', 0)
+                completion_pct = completion_res.get('completion_percentage', 0)
+                
+                logger.info(f"⏳ Scraping in progress: {completion_pct:.1f}% complete "
+                          f"({remaining} pages remaining)")
+                
+                return {
+                    'success': True,
+                    'status': 'continuing',
+                    'message': f"{remaining} pages remaining for {metadata['project_name']}",
+                    'metadata_id': metadata_id,
+                    'completion_percentage': completion_pct,
+                    'remaining_pages': remaining
+                }
+            
+        except Exception as e:
+            logger.error(f"Error handling metadata completion: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+    def _trigger_metadata_analytics(self, metadata_id: int) -> Dict:
+        """
+        Trigger analytics for a completed metadata scraping session
+        
+        Args:
+            metadata_id: ID of metadata record
+            
+        Returns:
+            Dictionary with analytics trigger status
+        """
+        try:
+            # Import here to avoid circular imports
+            from analytics_service import AnalyticsService
+            
+            analytics_service = AnalyticsService()
+            result = analytics_service.trigger_post_run_analytics(metadata_id)
+            
+            if result.get('success'):
+                logger.info(f"✅ Analytics triggered successfully for metadata {metadata_id}")
+            else:
+                logger.error(f"⚠️ Analytics trigger failed: {result.get('error')}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error triggering analytics: {e}")
+            return {'success': False, 'error': str(e)}
+
     # ==================== REAL-TIME DATA MONITORING ====================
     
     def monitor_run_realtime(self, project_id: int, run_token: str, target_pages: int = 1) -> Dict:
@@ -239,6 +380,11 @@ class MonitoringService:
                         total_pages=total_pages,
                         progress_percentage=100 if current_status == 'succeeded' else progress_pct
                     )
+                    
+                    # If run succeeded, check for metadata-based completion and auto-trigger next run
+                    if current_status == 'succeeded':
+                        self._handle_metadata_completion(project_id, run_token, total_pages, new_records)
+                    
                     break
                 
                 # Wait before next poll

@@ -7,7 +7,7 @@ import json
 import sys
 import sqlite3
 from datetime import datetime
-from database import ParseHubDatabase
+from backend.database import ParseHubDatabase
 
 
 class ScrapingSessionService:

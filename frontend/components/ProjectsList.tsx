@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   Loader2,
   AlertCircle,
+  X,
 } from "lucide-react";
 import SchedulerModal from "./SchedulerModal";
 import ColumnStatisticsModal from "./ColumnStatisticsModal";
@@ -62,18 +63,34 @@ export default function ProjectsList({
   );
 
   useEffect(() => {
-    // Group projects by brand/category
+    // Helper function to extract website domain from project name
+    // Pattern: "(Brand Name) ... website_domain_productname"
+    // Examples:
+    // "(MSA Pricing) Filter-technik.de_Kraftstoffvorfilter" -> "Filter-technik.de"
+    // "(Brand) example.com_product" -> "example.com"
+    const extractWebsite = (projectName: string): string => {
+      // Match pattern: ) followed by domain (with dots), followed by _
+      const match = projectName.match(/\)\s*([^_\s]+(?:\.[^_\s]+)*?)_/);
+      if (match && match[1]) {
+        return match[1];
+      }
+      // Fallback: use first 30 chars or project name
+      return projectName.substring(0, 30) || "Other";
+    };
+
+    // Group projects by website domain
     const groups = new Map<string, Project[]>();
 
     projects.forEach((project) => {
       const projectName = project.name || project.title || "Unknown";
-      // Extract brand from project name (split by underscore or space)
-      const brand = projectName.split(/[_\s]+/)[0] || "Other";
-      if (!groups.has(brand)) {
-        groups.set(brand, []);
+      // Extract website domain from project name
+      const website = extractWebsite(projectName);
+      
+      if (!groups.has(website)) {
+        groups.set(website, []);
       }
       // Preserve all project data including last_run
-      groups.get(brand)!.push({
+      groups.get(website)!.push({
         ...project,
         name: projectName,
       });
@@ -132,6 +149,41 @@ export default function ProjectsList({
     setSelectedProjectToken(token);
     setSelectedProjectName(name);
     setShowCSVModal(true);
+  };
+
+  const handleCancelRun = async (token: string) => {
+    setLoading(token);
+    try {
+      const response = await fetch(`/api/runs/${token}/cancel`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(
+          errorData.message || `Failed to cancel run: ${response.statusText}`
+        );
+      }
+
+      const data = await response.json();
+      console.log("Run cancelled successfully:", data);
+
+      // Trigger a refresh of projects to update status
+      if (onRunProject) {
+        // Force a refresh by calling the parent's refresh mechanism
+        window.dispatchEvent(new CustomEvent("projectStatusUpdated"));
+      }
+    } catch (error) {
+      console.error("Error cancelling run:", error);
+      alert(
+        `Failed to cancel run: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
+    } finally {
+      setLoading(null);
+    }
   };
 
   const handlePageChange = (token: string, value: string) => {
@@ -223,10 +275,9 @@ export default function ProjectsList({
             {Array.from(groupedByBrand.entries())
               .sort(([brandA], [brandB]) => brandA.localeCompare(brandB))
               .map(([brand, brandProjects]) => (
-                <>
+                <React.Fragment key={brand}>
                   {/* Brand Row */}
                   <tr
-                    key={brand}
                     className="bg-slate-800/60 hover:bg-slate-700/40 transition-all duration-200 cursor-pointer group"
                     onClick={() => toggleBrand(brand)}
                   >
@@ -418,11 +469,28 @@ export default function ProjectsList({
                             >
                               <FileJson size={14} />
                             </button>
+                            {project.last_run?.status === "running" && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleCancelRun(project.token);
+                                }}
+                                disabled={loading === project.token}
+                                className="inline-flex items-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 disabled:bg-slate-700 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-all duration-200 shadow-md hover:shadow-red-500/25 disabled:shadow-none"
+                                title="Cancel Run"
+                              >
+                                {loading === project.token ? (
+                                  <Loader2 size={14} className="animate-spin" />
+                                ) : (
+                                  <X size={14} />
+                                )}
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
                     ))}
-                </>
+                </React.Fragment>
               ))}
           </tbody>
         </table>

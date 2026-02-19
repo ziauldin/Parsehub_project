@@ -2,7 +2,7 @@
 Analytics Service - Provides detailed analytics and data analysis
 """
 
-from database import ParseHubDatabase
+from backend.database import ParseHubDatabase
 from datetime import datetime, timedelta
 from typing import Dict, List
 import json
@@ -423,7 +423,73 @@ class AnalyticsService:
 
         return "\n".join(csv_lines)
 
+    def trigger_post_run_analytics(self, metadata_id: int, run_token: str = None) -> Dict:
+        """
+        Trigger analytics after a successful run completion
+        
+        Args:
+            metadata_id: ID of metadata record
+            run_token: Optional ParseHub run token for additional context
+            
+        Returns:
+            Dictionary with analytics result
+        """
+        try:
+            # Get metadata record
+            metadata = self.db.get_metadata_by_id(metadata_id)
+            
+            if not metadata:
+                return {
+                    'success': False,
+                    'error': f'Metadata record not found: {metadata_id}'
+                }
+            
+            project_token = metadata.get('project_token')
+            if not project_token:
+                return {
+                    'success': False,
+                    'error': f'No project_token in metadata {metadata_id}'
+                }
+            
+            # Get analytics for the project
+            analytics = self.get_project_analytics(project_token)
+            
+            if not analytics:
+                return {
+                    'success': False,
+                    'error': f'Failed to generate analytics for {project_token}'
+                }
+            
+            # Store to database for caching
+            self.db.store_analytics_data(
+                project_token,
+                run_token,
+                analytics,
+                csv_data=self.generate_analytics_csv(project_token)
+            )
+            
+            print(f"[ANALYTICS] Triggered for metadata {metadata_id} (project: {metadata.get('project_name')})", file=sys.stderr)
+            
+            return {
+                'success': True,
+                'metadata_id': metadata_id,
+                'project_token': project_token,
+                'project_name': metadata.get('project_name'),
+                'analytics': {
+                    'total_records': analytics.get('overview', {}).get('total_records_scraped'),
+                    'completion_percentage': analytics.get('overview', {}).get('progress_percentage'),
+                    'total_runs': analytics.get('overview', {}).get('total_runs')
+                }
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Error triggering post-run analytics: {str(e)}", file=sys.stderr)
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     service = AnalyticsService()
     print("[OK] Analytics Service initialized!")

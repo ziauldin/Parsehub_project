@@ -16,16 +16,27 @@ class ParseHubDatabase:
         self.conn = None
         self.init_db()
 
+    def _get_connection(self):
+        """Get a new database connection with thread-safe settings"""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def connect(self):
         """Connect to database"""
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row
+        # check_same_thread=False allows the connection to be used in different threads
+        # SQLite will use internal locking for thread safety
+        self.conn = self._get_connection()
         return self.conn
 
     def disconnect(self):
         """Close database connection"""
         if self.conn:
-            self.conn.close()
+            try:
+                self.conn.close()
+            except:
+                pass
+            self.conn = None
 
     def init_db(self):
         """Initialize database schema"""
@@ -45,6 +56,23 @@ class ParseHubDatabase:
             )
         ''')
 
+        # Project Metadata Linking table - links projects to metadata
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS project_metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                metadata_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY (metadata_id) REFERENCES metadata(id) ON DELETE CASCADE,
+                UNIQUE(project_id, metadata_id)
+            )
+        ''')
+
+        # Create indexes for project_metadata
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_project_metadata_project_id ON project_metadata(project_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_project_metadata_metadata_id ON project_metadata(metadata_id)')
+
         # Runs table - tracks each execution
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS runs (
@@ -59,6 +87,8 @@ class ParseHubDatabase:
                 records_count INTEGER DEFAULT 0,
                 data_file TEXT,
                 is_empty BOOLEAN DEFAULT 0,
+                is_continuation BOOLEAN DEFAULT 0,
+                completion_percentage REAL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )
@@ -307,6 +337,66 @@ class ParseHubDatabase:
                 FOREIGN KEY (project_token) REFERENCES projects(token)
             )
         ''')
+
+        # Import batches - track Excel metadata imports
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT NOT NULL,
+                record_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'success',
+                error_message TEXT,
+                uploaded_by TEXT,
+                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Metadata table - project metadata sourced from Excel imports
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                personal_project_id TEXT UNIQUE NOT NULL,
+                project_id INTEGER,
+                project_token TEXT UNIQUE,
+                project_name TEXT NOT NULL,
+                last_run_date TIMESTAMP,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                region TEXT,
+                country TEXT,
+                brand TEXT,
+                website_url TEXT,
+                total_pages INTEGER,
+                total_products INTEGER,
+                current_page_scraped INTEGER DEFAULT 0,
+                current_product_scraped INTEGER DEFAULT 0,
+                last_known_url TEXT,
+                import_batch_id INTEGER,
+                status TEXT DEFAULT 'pending',
+                FOREIGN KEY (project_id) REFERENCES projects(id),
+                FOREIGN KEY (import_batch_id) REFERENCES import_batches(id),
+                FOREIGN KEY (project_token) REFERENCES projects(token)
+            )
+        ''')
+
+        # Create indexes for metadata filtering and sorting
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_region ON metadata(region)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_country ON metadata(country)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_brand ON metadata(brand)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_updated_date ON metadata(updated_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_status ON metadata(status)')
+
+        # Add missing columns to runs table if they don't exist (migration for existing DBs)
+        try:
+            cursor.execute('ALTER TABLE runs ADD COLUMN is_continuation BOOLEAN DEFAULT 0')
+        except:
+            pass  # Column already exists
+        
+        try:
+            cursor.execute('ALTER TABLE runs ADD COLUMN completion_percentage REAL DEFAULT 0')
+        except:
+            pass  # Column already exists
 
         conn.commit()
         self.disconnect()
@@ -1380,65 +1470,124 @@ class ParseHubDatabase:
             self.disconnect()
 
     def store_analytics_data(self, project_token: str, run_token: str, analytics_data: dict, records: list, csv_data: str = None):
-        """Store analytics data and records to database"""
+        """Store analytics data and records to database with improved error handling"""
         try:
+            # Validate inputs
+            if not project_token or not isinstance(project_token, str):
+                raise ValueError(f"Invalid project_token: {project_token}")
+            if not run_token or not isinstance(run_token, str):
+                raise ValueError(f"Invalid run_token: {run_token}")
+            if not isinstance(analytics_data, dict):
+                raise ValueError(f"analytics_data must be dict, got {type(analytics_data)}")
+            if not isinstance(records, list):
+                raise ValueError(f"records must be list, got {type(records)}")
+            
             conn = self.connect()
+            if not conn:
+                raise Exception("Failed to establish database connection")
+            
             cursor = conn.cursor()
             
-            # Store analytics cache
-            analytics_json = json.dumps(analytics_data)
-            cursor.execute('''
-                INSERT OR REPLACE INTO analytics_cache
-                (project_token, run_token, total_records, total_fields, total_runs, completed_runs, 
-                 progress_percentage, status, analytics_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                project_token,
-                run_token,
-                analytics_data['overview']['total_records_scraped'],
-                analytics_data['data_quality']['total_fields'],
-                analytics_data['overview']['total_runs'],
-                analytics_data['overview']['completed_runs'],
-                analytics_data['overview']['progress_percentage'],
-                analytics_data['recovery']['status'],
-                analytics_json,
-                datetime.now().isoformat()
-            ))
+            # Validate and serialize analytics data
+            try:
+                analytics_json = json.dumps(analytics_data, default=str)
+                # Verify the JSON is valid by parsing it back
+                json.loads(analytics_json)
+            except Exception as e:
+                print(f"Error serializing analytics_data: {e}, attempting to extract valid fields...")
+                # Fallback: extract only serializable fields
+                safe_data = {}
+                for key, value in analytics_data.items():
+                    try:
+                        test_json = json.dumps({key: value}, default=str)
+                        safe_data[key] = value
+                    except:
+                        safe_data[key] = str(value)
+                analytics_json = json.dumps(safe_data, default=str)
+            
+            # Store analytics cache with error handling
+            try:
+                overview = analytics_data.get('overview', {})
+                data_quality = analytics_data.get('data_quality', {})
+                recovery = analytics_data.get('recovery', {})
+                
+                total_records = overview.get('total_records_scraped', 0)
+                total_fields = data_quality.get('total_fields', 0)
+                total_runs = overview.get('total_runs', 0)
+                completed_runs = overview.get('completed_runs', 0)
+                progress_percentage = overview.get('progress_percentage', 0)
+                status = recovery.get('status', 'unknown')
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO analytics_cache
+                    (project_token, run_token, total_records, total_fields, total_runs, completed_runs, 
+                     progress_percentage, status, analytics_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    project_token,
+                    run_token,
+                    total_records,
+                    total_fields,
+                    total_runs,
+                    completed_runs,
+                    progress_percentage,
+                    status,
+                    analytics_json,
+                    datetime.now().isoformat()
+                ))
+            except Exception as e:
+                print(f"Warning: Failed to store analytics cache: {e}")
+                # Attempt to continue with record storage
             
             # Store CSV data if provided
             if csv_data:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO csv_exports
-                    (project_token, run_token, csv_data, row_count, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (
-                    project_token,
-                    run_token,
-                    csv_data,
-                    len(records),
-                    datetime.now().isoformat()
-                ))
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO csv_exports
+                        (project_token, run_token, csv_data, row_count, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        project_token,
+                        run_token,
+                        csv_data,
+                        len(records),
+                        datetime.now().isoformat()
+                    ))
+                except Exception as e:
+                    print(f"Warning: Failed to store CSV data: {e}")
             
-            # Store individual records
-            for idx, record in enumerate(records):
-                record_json = json.dumps(record) if isinstance(record, dict) else str(record)
-                cursor.execute('''
-                    INSERT OR REPLACE INTO analytics_records
-                    (project_token, run_token, record_index, record_data)
-                    VALUES (?, ?, ?, ?)
-                ''', (
-                    project_token,
-                    run_token,
-                    idx,
-                    record_json
-                ))
+            # Store individual records with batch processing
+            stored_count = 0
+            batch_size = 100
+            for idx in range(0, len(records), batch_size):
+                batch = records[idx:idx + batch_size]
+                for i, record in enumerate(batch):
+                    try:
+                        record_json = json.dumps(record, default=str) if isinstance(record, dict) else str(record)
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO analytics_records
+                            (project_token, run_token, record_index, record_data)
+                            VALUES (?, ?, ?, ?)
+                        ''', (
+                            project_token,
+                            run_token,
+                            idx + i,
+                            record_json
+                        ))
+                        stored_count += 1
+                    except Exception as e:
+                        print(f"Warning: Failed to store record {idx + i}: {e}")
+                        continue
             
             conn.commit()
             self.disconnect()
+            print(f"Successfully stored analytics: {stored_count} records, {total_records} total_records")
             return True
             
         except Exception as e:
             print(f"Error storing analytics data: {e}")
+            import traceback
+            traceback.print_exc()
             self.disconnect()
             return False
 
@@ -1521,6 +1670,831 @@ class ParseHubDatabase:
             print(f"Error clearing analytics data: {e}")
             self.disconnect()
             return False
+
+    # ===== METADATA MANAGEMENT METHODS =====
+
+    def create_import_batch(self, file_name: str, record_count: int = 0, uploaded_by: str = None) -> int:
+        """Create an import batch record and return batch_id"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO import_batches (file_name, record_count, uploaded_by, status)
+                VALUES (?, ?, ?, ?)
+            ''', (file_name, record_count, uploaded_by, 'success'))
+            
+            conn.commit()
+            batch_id = cursor.lastrowid
+            self.disconnect()
+            return batch_id
+            
+        except Exception as e:
+            print(f"Error creating import batch: {e}")
+            self.disconnect()
+            return None
+
+    def add_metadata_record(self, personal_project_id: str, project_name: str, 
+                          region: str = None, country: str = None, brand: str = None,
+                          website_url: str = None, total_pages: int = None,
+                          total_products: int = None, import_batch_id: int = None,
+                          project_token: str = None, project_id: int = None) -> int:
+        """Add or update a metadata record"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO metadata 
+                (personal_project_id, project_id, project_token, project_name, 
+                 region, country, brand, website_url, total_pages, total_products,
+                 import_batch_id, updated_date, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                personal_project_id, project_id, project_token, project_name,
+                region, country, brand, website_url, total_pages, total_products,
+                import_batch_id, datetime.now().isoformat(), 'pending'
+            ))
+            
+            conn.commit()
+            metadata_id = cursor.lastrowid
+            self.disconnect()
+            return metadata_id
+            
+        except Exception as e:
+            print(f"Error adding metadata record: {e}")
+            self.disconnect()
+            return None
+
+    def get_metadata_filtered(self, region: str = None, country: str = None, 
+                            brand: str = None, limit: int = 100, offset: int = 0):
+        """Get metadata records with optional filters"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            query = "SELECT * FROM metadata WHERE 1=1"
+            params = []
+            
+            if region:
+                query += " AND region = ?"
+                params.append(region)
+            if country:
+                query += " AND country = ?"
+                params.append(country)
+            if brand:
+                query += " AND brand = ?"
+                params.append(brand)
+            
+            # Sort by updated_date descending
+            query += " ORDER BY updated_date DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            
+            cursor.execute(query, params)
+            records = [dict(row) for row in cursor.fetchall()]
+            
+            self.disconnect()
+            return records
+            
+        except Exception as e:
+            print(f"Error getting metadata: {e}")
+            self.disconnect()
+            return []
+
+    def get_metadata_by_id(self, metadata_id: int):
+        """Get a specific metadata record by ID"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT * FROM metadata WHERE id = ?", (metadata_id,))
+            record = cursor.fetchone()
+            
+            self.disconnect()
+            return dict(record) if record else None
+            
+        except Exception as e:
+            print(f"Error getting metadata by ID: {e}")
+            self.disconnect()
+            return None
+
+    def update_metadata_progress(self, metadata_id: int, current_page_scraped: int = None,
+                                current_product_scraped: int = None, last_known_url: str = None,
+                                last_run_date: str = None, completion_percentage: float = None):
+        """Update scraping progress in metadata"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            updates = ["updated_date = ?"]
+            params = [datetime.now().isoformat()]
+            
+            if current_page_scraped is not None:
+                updates.append("current_page_scraped = ?")
+                params.append(current_page_scraped)
+            if current_product_scraped is not None:
+                updates.append("current_product_scraped = ?")
+                params.append(current_product_scraped)
+            if last_known_url is not None:
+                updates.append("last_known_url = ?")
+                params.append(last_known_url)
+            if last_run_date is not None:
+                updates.append("last_run_date = ?")
+                params.append(last_run_date)
+            
+            params.append(metadata_id)
+            
+            query = f"UPDATE metadata SET {', '.join(updates)} WHERE id = ?"
+            cursor.execute(query, params)
+            
+            conn.commit()
+            self.disconnect()
+            return True
+            
+        except Exception as e:
+            print(f"Error updating metadata progress: {e}")
+            self.disconnect()
+            return False
+
+    def get_distinct_filter_values(self, filter_type: str):
+        """Get distinct values for a filter (region, country, brand)"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            if filter_type not in ['region', 'country', 'brand']:
+                return []
+            
+            cursor.execute(f"SELECT DISTINCT {filter_type} FROM metadata WHERE {filter_type} IS NOT NULL ORDER BY {filter_type}")
+            values = [row[0] for row in cursor.fetchall()]
+            
+            self.disconnect()
+            return values
+            
+        except Exception as e:
+            print(f"Error getting filter values: {e}")
+            self.disconnect()
+            return []
+
+    def get_metadata_by_personal_id(self, personal_project_id: str):
+        """Get metadata by personal project ID"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT * FROM metadata WHERE personal_project_id = ?", (personal_project_id,))
+            record = cursor.fetchone()
+            
+            self.disconnect()
+            return dict(record) if record else None
+            
+        except Exception as e:
+            print(f"Error getting metadata by personal ID: {e}")
+            self.disconnect()
+            return None
+
+    def delete_metadata(self, metadata_id: int):
+        """Delete a metadata record"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("DELETE FROM metadata WHERE id = ?", (metadata_id,))
+            
+            conn.commit()
+            self.disconnect()
+            return True
+            
+        except Exception as e:
+            print(f"Error deleting metadata: {e}")
+            self.disconnect()
+            return False
+
+    def get_import_batches(self, limit: int = 50, offset: int = 0):
+        """Get import batch history"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, file_name, record_count, status, uploaded_by, upload_date 
+                FROM import_batches 
+                ORDER BY upload_date DESC 
+                LIMIT ? OFFSET ?
+            """, (limit, offset))
+            
+            records = cursor.fetchall()
+            self.disconnect()
+            
+            return [dict(record) for record in records] if records else []
+            
+        except Exception as e:
+            print(f"Error getting import batches: {e}")
+            self.disconnect()
+            return []
+
+    def sync_projects(self, projects_list: list) -> dict:
+        """Sync projects from ParseHub API to database (insert/update)"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            inserted = 0
+            updated = 0
+            
+            for project in projects_list:
+                token = project.get('token')
+                title = project.get('title') or project.get('name', '')
+                owner_email = project.get('owner_email')
+                main_site = project.get('main_site')
+                
+                if not token:
+                    continue
+                
+                # Try to insert, update if exists
+                cursor.execute('''
+                    INSERT INTO projects (token, title, owner_email, main_site, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(token) DO UPDATE SET
+                        title = excluded.title,
+                        owner_email = excluded.owner_email,
+                        main_site = excluded.main_site,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (token, title, owner_email, main_site))
+                
+                cursor.execute('SELECT id FROM projects WHERE token = ?', (token,))
+                result = cursor.fetchone()
+                
+                if cursor.rowcount > 0:
+                    if cursor.lastrowid:
+                        inserted += 1
+                    else:
+                        updated += 1
+            
+            # Auto-link projects to metadata by project_name matching
+            self._link_projects_to_metadata(cursor)
+            
+            conn.commit()
+            self.disconnect()
+            
+            return {
+                'success': True,
+                'inserted': inserted,
+                'updated': updated,
+                'total': len(projects_list)
+            }
+        except Exception as e:
+            print(f"Error syncing projects: {e}")
+            self.disconnect()
+            return {'success': False, 'error': str(e)}
+
+    def _link_projects_to_metadata(self, cursor):
+        """Auto-link projects to metadata by matching project names"""
+        try:
+            # Get unlinked metadata records
+            cursor.execute('''
+                SELECT id, project_name FROM metadata 
+                WHERE project_name IS NOT NULL AND project_name != ''
+                AND id NOT IN (SELECT metadata_id FROM project_metadata)
+            ''')
+            
+            unlinked_metadata = cursor.fetchall()
+            
+            for metadata in unlinked_metadata:
+                metadata_id = metadata[0]
+                project_name = metadata[1].strip().lower()
+                
+                # Search for matching project by name
+                cursor.execute('''
+                    SELECT id FROM projects 
+                    WHERE LOWER(title) LIKE ?
+                    LIMIT 1
+                ''', (f'%{project_name}%',))
+                
+                project = cursor.fetchone()
+                
+                if project:
+                    project_id = project[0]
+                    try:
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO project_metadata (project_id, metadata_id)
+                            VALUES (?, ?)
+                        ''', (project_id, metadata_id))
+                    except:
+                        pass  # Link already exists
+
+        except Exception as e:
+            print(f"Error linking projects to metadata: {e}")
+
+    def get_projects_with_metadata(self, limit: int = 100, offset: int = 0,
+                                   region: str = None, country: str = None,
+                                   brand: str = None) -> dict:
+        """Get projects joined with metadata, with optional filtering"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            # Build base query
+            base_query = '''
+                SELECT DISTINCT p.id
+                FROM projects p
+                LEFT JOIN project_metadata pm ON p.id = pm.project_id
+                LEFT JOIN metadata m ON pm.metadata_id = m.id
+                WHERE 1=1
+            '''
+            
+            params = []
+            
+            if region:
+                base_query += ' AND m.region = ?'
+                params.append(region)
+            
+            if country:
+                base_query += ' AND m.country = ?'
+                params.append(country)
+            
+            if brand:
+                base_query += ' AND m.brand = ?'
+                params.append(brand)
+            
+            # Count total with filters
+            count_query = f"SELECT COUNT(*) FROM ({base_query}) as count_subquery"
+            cursor.execute(count_query, params)
+            total = cursor.fetchone()[0]
+            
+            # Get full results with pagination
+            full_query = '''
+                SELECT
+                    p.id, p.token, p.title, p.owner_email, p.main_site,
+                    p.created_at, p.updated_at,
+                    m.id as metadata_id, m.region, m.country, m.brand,
+                    m.project_name, m.website_url, m.status
+                FROM projects p
+                LEFT JOIN project_metadata pm ON p.id = pm.project_id
+                LEFT JOIN metadata m ON pm.metadata_id = m.id
+                WHERE 1=1
+            '''
+            
+            filter_params = []
+            
+            if region:
+                full_query += ' AND m.region = ?'
+                filter_params.append(region)
+            
+            if country:
+                full_query += ' AND m.country = ?'
+                filter_params.append(country)
+            
+            if brand:
+                full_query += ' AND m.brand = ?'
+                filter_params.append(brand)
+            
+            # Add ordering and pagination
+            full_query += ' ORDER BY p.updated_at DESC LIMIT ? OFFSET ?'
+            filter_params.extend([limit, offset])
+            
+            cursor.execute(full_query, filter_params)
+            rows = cursor.fetchall()
+            
+            # Group results: one project with all its metadata
+            projects_dict = {}
+            for row in rows:
+                project_id = row[0]
+                
+                if project_id not in projects_dict:
+                    projects_dict[project_id] = {
+                        'id': row[0],
+                        'token': row[1],
+                        'title': row[2],
+                        'owner_email': row[3],
+                        'main_site': row[4],
+                        'created_at': row[5],
+                        'updated_at': row[6],
+                        'metadata': []
+                    }
+                
+                # Add metadata if present
+                if row[7]:  # metadata_id
+                    projects_dict[project_id]['metadata'].append({
+                        'id': row[7],
+                        'region': row[8],
+                        'country': row[9],
+                        'brand': row[10],
+                        'project_name': row[11],
+                        'website_url': row[12],
+                        'status': row[13]
+                    })
+            
+            self.disconnect()
+            
+            return {
+                'success': True,
+                'projects': list(projects_dict.values()),
+                'total': total,
+                'limit': limit,
+                'offset': offset
+            }
+            
+        except Exception as e:
+            print(f"Error getting projects with metadata: {e}")
+            self.disconnect()
+            return {'success': False, 'error': str(e), 'projects': []}
+
+    def get_projects_count(self) -> int:
+        """Get total count of synced projects"""
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM projects')
+            count = cursor.fetchone()[0]
+            
+            self.disconnect()
+            return count
+        except Exception as e:
+            print(f"Error getting projects count: {e}")
+            self.disconnect()
+            return 0
+
+    def extract_website_from_title(self, title: str) -> str:
+        """
+        Extract website domain from project title
+        Pattern: "(Brand Name) ... website_domain_productname"
+        Examples:
+        "(MSA Pricing) Filter-technik.de_Kraftstoffvorfilter" -> "Filter-technik.de"
+        "(Brand) example.com_product" -> "example.com"
+        "(Brand) aisbelgium.be_something" -> "aisbelgium.be"
+        """
+        import re
+        if not title:
+            return "Unknown"
+        
+        # Match pattern: ) followed by domain (with dots/hyphens), followed by _
+        match = re.search(r'\)\s*([^_\s]+(?:\.[^_\s]+)*?)_', title)
+        if match and match[1]:
+            return match[1]
+        
+        # Alternative: look for domain pattern anywhere
+        match = re.search(r'([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,})', title)
+        if match:
+            return match.group(1)
+        
+        # Fallback
+        return title.split('_')[0] if '_' in title else title[:30]
+
+    def get_distinct_metadata_values(self, field: str) -> list:
+        """Get distinct values from metadata table"""
+        try:
+            if field not in ['region', 'country', 'brand']:
+                return []
+            
+            # Create a fresh connection for this operation (thread-safe)
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute(f"SELECT DISTINCT {field} FROM metadata WHERE {field} IS NOT NULL AND {field} != '' ORDER BY {field}")
+            values = [row[0] for row in cursor.fetchall()]
+            
+            conn.close()
+            return values
+            
+        except Exception as e:
+            print(f"Error getting distinct metadata values for {field}: {e}")
+            return []
+
+    def get_distinct_project_websites(self) -> list:
+        """Get all distinct website domains from project titles"""
+        try:
+            # Create a fresh connection for this operation (thread-safe)
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT DISTINCT title FROM projects ORDER BY title')
+            rows = cursor.fetchall()
+            
+            websites = set()
+            for row in rows:
+                title = row[0] if row[0] else "Unknown"
+                website = self.extract_website_from_title(title)
+                if website:
+                    websites.add(website)
+            
+            conn.close()
+            return sorted(list(websites))
+            
+        except Exception as e:
+            print(f"Error getting project websites: {e}")
+            return []
+
+    def get_projects_with_website_grouping(self, region: str = None, country: str = None, 
+                                           brand: str = None, limit: int = 100, offset: int = 0) -> dict:
+        """
+        Get projects with website grouping and metadata filtering
+        Returns projects grouped by website with metadata mapping
+        """
+        try:
+            # Create a fresh connection for this operation (thread-safe)
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # Build query with metadata joins and filtering
+            base_query = '''
+                SELECT DISTINCT p.id, p.token, p.title, p.owner_email, p.main_site,
+                       p.created_at, p.updated_at,
+                       m.id as metadata_id, m.region, m.country, m.brand,
+                       m.project_name, m.website_url, m.status
+                FROM projects p
+                LEFT JOIN project_metadata pm ON p.id = pm.project_id
+                LEFT JOIN metadata m ON pm.metadata_id = m.id
+                WHERE 1=1
+            '''
+            
+            params = []
+            
+            # Apply metadata filters
+            if region:
+                base_query += ' AND m.region = ?'
+                params.append(region)
+            
+            if country:
+                base_query += ' AND m.country = ?'
+                params.append(country)
+            
+            if brand:
+                base_query += ' AND m.brand = ?'
+                params.append(brand)
+            
+            # For count: execute a simpler query
+            count_query = 'SELECT COUNT(DISTINCT p.id) FROM projects p LEFT JOIN project_metadata pm ON p.id = pm.project_id LEFT JOIN metadata m ON pm.metadata_id = m.id WHERE 1=1'
+            if region:
+                count_query += ' AND m.region = ?'
+            if country:
+                count_query += ' AND m.country = ?'
+            if brand:
+                count_query += ' AND m.brand = ?'
+            
+            try:
+                cursor.execute(count_query, params)
+                count_result = cursor.fetchone()
+                total = count_result[0] if count_result else 0
+            except Exception as count_err:
+                # If count fails, just set total to unknown
+                total = -1
+            
+            # Add pagination
+            base_query += ' ORDER BY p.updated_at DESC LIMIT ? OFFSET ?'
+            params.extend([limit, offset])
+            
+            cursor.execute(base_query, params)
+            rows = cursor.fetchall()
+            
+            # Group by website and project
+            websites_dict = {}
+            projects_dict = {}
+            
+            for row in rows:
+                project_id = row[0]
+                title = row[2]
+                website = self.extract_website_from_title(title)
+                
+                # Initialize website group
+                if website not in websites_dict:
+                    websites_dict[website] = {
+                        'website': website,
+                        'projects': [],
+                        'project_count': 0,
+                        'metadata_count': 0
+                    }
+                
+                # Initialize project
+                if project_id not in projects_dict:
+                    project_data = {
+                        'id': row[0],
+                        'token': row[1],
+                        'title': row[2],
+                        'owner_email': row[3],
+                        'main_site': row[4],
+                        'created_at': row[5],
+                        'updated_at': row[6],
+                        'website': website,
+                        'metadata': []
+                    }
+                    projects_dict[project_id] = project_data
+                    websites_dict[website]['projects'].append(project_data)
+                    websites_dict[website]['project_count'] += 1
+                
+                # Add metadata if present
+                if row[7]:  # metadata_id
+                    metadata_item = {
+                        'id': row[7],
+                        'region': row[8],
+                        'country': row[9],
+                        'brand': row[10],
+                        'project_name': row[11],
+                        'website_url': row[12],
+                        'status': row[13]
+                    }
+                    projects_dict[project_id]['metadata'].append(metadata_item)
+                    websites_dict[website]['metadata_count'] += 1
+            
+            conn.close()
+            
+            return {
+                'success': True,
+                'by_website': list(websites_dict.values()),
+                'by_project': list(projects_dict.values()),
+                'total': total,
+                'limit': limit,
+                'offset': offset
+            }
+            
+        except Exception as e:
+            print(f"Error getting projects with website grouping: {e}")
+            return {'success': False, 'error': str(e), 'by_website': [], 'by_project': []}
+
+    def get_all_metadata_by_website(self) -> dict:
+        """
+        Get all metadata records indexed by website for fast lookups
+        Returns dict: {website: metadata_dict}
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT * FROM metadata')
+            rows = cursor.fetchall()
+            
+            metadata_by_website = {}
+            
+            for row in rows:
+                website = row[11]  # website_url column (0-indexed)
+                if website:
+                    metadata_by_website[website.lower()] = {
+                        'id': row[0],
+                        'personal_project_id': row[1],
+                        'project_name': row[4],
+                        'region': row[8],
+                        'country': row[9],
+                        'brand': row[10],
+                        'website_url': row[11],
+                        'status': row[18]
+                    }
+                
+                # Also index by project_name for fallback
+                project_name = row[4]
+                if project_name and project_name.lower() not in metadata_by_website:
+                    metadata_by_website[project_name.lower()] = {
+                        'id': row[0],
+                        'personal_project_id': row[1],
+                        'project_name': project_name,
+                        'region': row[8],
+                        'country': row[9],
+                        'brand': row[10],
+                        'website_url': row[11],
+                        'status': row[18]
+                    }
+            
+            conn.close()
+            return metadata_by_website
+            
+        except Exception as e:
+            print(f"Error getting metadata: {e}")
+            return {}
+    
+    def match_projects_to_metadata_batch(self, projects: list) -> list:
+        """
+        Match a batch of projects to metadata efficiently
+        
+        Args:
+            projects: List of project dicts with 'title' field
+            
+        Returns:
+            Same projects list with 'metadata' field added where matching
+        """
+        try:
+            # Pre-load all metadata indexed by website
+            metadata_by_website = self.get_all_metadata_by_website()
+            
+            # Quick match using pre-loaded metadata
+            for proj in projects:
+                title = proj.get('title', '')
+                website = self.extract_website_from_title(title)
+                
+                if website and website != 'Unknown':
+                    # Try exact match
+                    if website.lower() in metadata_by_website:
+                        proj['metadata'] = metadata_by_website[website.lower()]
+                        continue
+                    
+                    # Try partial match (contains)
+                    for key, metadata in metadata_by_website.items():
+                        if website.lower() in key or key in website.lower():
+                            proj['metadata'] = metadata
+                            break
+            
+            return projects
+            
+        except Exception as e:
+            print(f"Error in batch metadata matching: {e}")
+            return projects
+
+    def match_project_to_metadata(self, project_title: str) -> dict:
+        """
+        Match a project title with metadata by multiple strategies:
+        1. Extract website domain from title and match against metadata.project_name or website_url
+        2. Fallback to domain-based matching if project_name matching fails
+        
+        Pattern: "(Brand) domain_product info"
+        Extract: "domain" (the part before underscore)
+        
+        Args:
+            project_title: Full project title from ParseHub API
+            
+        Returns:
+            Metadata dict if matched, empty dict if not found
+        """
+        try:
+            if not project_title:
+                return {}
+            
+            import re
+            
+            # Extract website domain from title
+            # Pattern: ") domain_something" -> extract "domain"
+            website = self.extract_website_from_title(project_title)
+            
+            if not website or website == 'Unknown':
+                return {}
+            
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # Strategy 1: Match by website domain (case-insensitive)
+            cursor.execute(
+                'SELECT * FROM metadata WHERE LOWER(project_name) = ? LIMIT 1',
+                (website.lower(),)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                conn.close()
+                return {
+                    'id': row[0],
+                    'personal_project_id': row[1],
+                    'project_name': row[4],
+                    'region': row[8],
+                    'country': row[9],
+                    'brand': row[10],
+                    'website_url': row[11],
+                    'status': row[18]
+                }
+            
+            # Strategy 2: Match against website_url
+            cursor.execute(
+                'SELECT * FROM metadata WHERE website_url = ? LIMIT 1',
+                (website,)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                conn.close()
+                return {
+                    'id': row[0],
+                    'personal_project_id': row[1],
+                    'project_name': row[4],
+                    'region': row[8],
+                    'country': row[9],
+                    'brand': row[10],
+                    'website_url': row[11],
+                    'status': row[18]
+                }
+            
+            # Strategy 3: Partial match - search for website in project_name
+            cursor.execute(
+                'SELECT * FROM metadata WHERE LOWER(project_name) LIKE ? LIMIT 1',
+                (f'%{website.lower()}%',)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                conn.close()
+                return {
+                    'id': row[0],
+                    'personal_project_id': row[1],
+                    'project_name': row[4],
+                    'region': row[8],
+                    'country': row[9],
+                    'brand': row[10],
+                    'website_url': row[11],
+                    'status': row[18]
+                }
+            
+            conn.close()
+            return {}
+            
+        except Exception as e:
+            print(f"Error matching project to metadata: {e}")
+            return {}
 
 
 if __name__ == '__main__':

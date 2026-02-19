@@ -8,9 +8,10 @@ import sys
 import time
 import requests
 from typing import Dict, List
-from url_generator import URLGenerator
-from scraping_session_service import ScrapingSessionService
-from data_consolidation_service import DataConsolidationService
+from backend.url_generator import URLGenerator
+from backend.scraping_session_service import ScrapingSessionService
+from backend.data_consolidation_service import DataConsolidationService
+from backend.database import ParseHubDatabase
 
 
 class AutoRunnerService:
@@ -20,6 +21,7 @@ class AutoRunnerService:
         self.api_key = os.getenv('PARSEHUB_API_KEY', '')
         self.base_url = os.getenv('PARSEHUB_BASE_URL', 'https://www.parsehub.com/api/v2')
         self.session_service = ScrapingSessionService()
+        self.db = ParseHubDatabase()
 
     def get_project_details(self, project_token: str) -> Dict:
         """Fetch project details from ParseHub API"""
@@ -249,6 +251,199 @@ class AutoRunnerService:
         except Exception as e:
             print(f"[ERROR] Error in iteration {iteration_number}: {str(e)}", file=sys.stderr)
             return {'success': False, 'error': str(e)}
+
+    def check_scraping_completion(self, metadata_id: int) -> Dict:
+        """
+        Check if scraping is complete by comparing current_page_scraped with total_pages
+        
+        Args:
+            metadata_id: ID of metadata record to check
+            
+        Returns:
+            Dictionary with completion status and details
+        """
+        try:
+            # Get metadata record
+            metadata = self.db.get_metadata_by_id(metadata_id)
+            
+            if not metadata:
+                return {
+                    'success': False,
+                    'error': f'Metadata record not found: {metadata_id}',
+                    'is_complete': False
+                }
+            
+            current_page = metadata.get('current_page_scraped', 0)
+            total_pages = metadata.get('total_pages')
+            
+            # Check completion
+            if total_pages is None or total_pages <= 0:
+                return {
+                    'success': True,
+                    'is_complete': False,
+                    'reason': 'Total pages not set',
+                    'current_page': current_page,
+                    'total_pages': total_pages,
+                    'completion_percentage': 0
+                }
+            
+            is_complete = current_page >= total_pages
+            completion_percentage = (current_page / total_pages * 100) if total_pages > 0 else 0
+            
+            result = {
+                'success': True,
+                'is_complete': is_complete,
+                'current_page': current_page,
+                'total_pages': total_pages,
+                'completion_percentage': round(completion_percentage, 2),
+                'remaining_pages': max(0, total_pages - current_page),
+                'metadata_id': metadata_id,
+                'project_name': metadata.get('project_name'),
+                'brand': metadata.get('brand')
+            }
+            
+            if is_complete:
+                print(f"[OK] Scraping complete for {metadata.get('project_name')}: "
+                      f"{current_page}/{total_pages} pages", file=sys.stderr)
+            else:
+                print(f"[INFO] Scraping in progress for {metadata.get('project_name')}: "
+                      f"{current_page}/{total_pages} pages ({completion_percentage:.1f}%)", file=sys.stderr)
+            
+            return result
+            
+        except Exception as e:
+            print(f"[ERROR] Error checking completion for metadata {metadata_id}: {str(e)}", file=sys.stderr)
+            return {
+                'success': False,
+                'error': str(e),
+                'is_complete': False
+            }
+
+    def handle_completion_and_continue(self, metadata_id: int, last_run_token: str = None) -> Dict:
+        """
+        After a run completes:
+        1. Check if scraping is complete
+        2. If complete: trigger analytics
+        3. If not complete: prepare next run with updated URL
+        
+        Args:
+            metadata_id: ID of metadata record
+            last_run_token: Optional token of last completed run for data extraction
+            
+        Returns:
+            Dictionary with next steps
+        """
+        try:
+            completion_res = self.check_scraping_completion(metadata_id)
+            
+            if not completion_res['success']:
+                return {
+                    'success': False,
+                    'error': completion_res['error'],
+                    'next_action': None
+                }
+            
+            is_complete = completion_res['is_complete']
+            
+            if is_complete:
+                print(f"[COMPLETE] Scraping complete for metadata {metadata_id}", file=sys.stderr)
+                return {
+                    'success': True,
+                    'is_complete': True,
+                    'next_action': 'trigger_analytics',
+                    'completion_details': completion_res
+                }
+            
+            else:
+                # Not yet complete - prepare for next iteration
+                metadata = self.db.get_metadata_by_id(metadata_id)
+                current_page = metadata.get('current_page_scraped', 0)
+                next_page = current_page + 1
+                
+                print(f"[CONTINUE] Preparing next run for metadata {metadata_id}: "
+                      f"page {next_page}/{metadata.get('total_pages')}", file=sys.stderr)
+                
+                return {
+                    'success': True,
+                    'is_complete': False,
+                    'next_action': 'trigger_next_run',
+                    'next_page': next_page,
+                    'completion_details': completion_res
+                }
+            
+        except Exception as e:
+            print(f"[ERROR] Error handling completion for metadata {metadata_id}: {str(e)}", file=sys.stderr)
+            return {
+                'success': False,
+                'error': str(e),
+                'next_action': None
+            }
+
+    def update_metadata_after_run(self, metadata_id: int, csv_data: str = None,
+                                  pages_scraped: int = None, last_known_url: str = None) -> Dict:
+        """
+        Update metadata record after successful run completion
+        
+        Args:
+            metadata_id: ID of metadata record
+            csv_data: CSV data from the run (used to count records)
+            pages_scraped: Number of pages scraped in this run
+            last_known_url: URL of last page scraped
+            
+        Returns:
+            Dictionary with update status
+        """
+        try:
+            metadata = self.db.get_metadata_by_id(metadata_id)
+            
+            if not metadata:
+                return {
+                    'success': False,
+                    'error': f'Metadata record not found: {metadata_id}'
+                }
+            
+            current_page = metadata.get('current_page_scraped', 0)
+            
+            # Calculate new current_page_scraped
+            if pages_scraped:
+                new_current_page = current_page + pages_scraped
+            else:
+                # Count records/pages from CSV if provided
+                if csv_data:
+                    record_count = DataConsolidationService.get_record_count(csv_data)
+                    new_current_page = current_page + max(1, record_count // 10)  # Estimate 10 records per page
+                else:
+                    new_current_page = current_page + 1
+            
+            # Update progress
+            update_res = self.db.update_metadata_progress(
+                metadata_id,
+                current_page_scraped=new_current_page,
+                last_known_url=last_known_url,
+                last_run_date=time.strftime('%Y-%m-%d %H:%M:%S')
+            )
+            
+            if update_res:
+                print(f"[OK] Updated metadata {metadata_id}: "
+                      f"pages {current_page} → {new_current_page}", file=sys.stderr)
+                return {
+                    'success': True,
+                    'previous_page': current_page,
+                    'new_page': new_current_page,
+                    'metadata_id': metadata_id
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': 'Failed to update database'
+                }
+            
+        except Exception as e:
+            print(f"[ERROR] Error updating metadata {metadata_id}: {str(e)}", file=sys.stderr)
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     def run_incremental_scraping(self, session_id: int, project_token: str,
                                 project_name: str, original_url: str,
