@@ -1118,6 +1118,101 @@ def diagnose_metadata():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/diagnosis/metadata-raw', methods=['GET'])
+def inspect_metadata_raw():
+    """
+    Raw metadata table inspection - shows schema and sample rows
+    Useful for debugging missing columns or NULL values
+    """
+    if not validate_api_key(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        from pg_connection import is_postgres, get_pg_connection, release_pg_connection
+        
+        if not is_postgres():
+            return jsonify({'error': 'PostgreSQL not available', 'success': False}), 400
+        
+        conn = get_pg_connection()
+        cursor = conn.cursor()
+        
+        # Get table schema
+        cursor.execute('''
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = 'metadata'
+            ORDER BY ordinal_position
+        ''')
+        schema = [{'column': row[0], 'type': row[1], 'nullable': row[2]} for row in cursor.fetchall()]
+        
+        # Get row count
+        cursor.execute('SELECT COUNT(*) FROM metadata')
+        row_count = cursor.fetchone()[0]
+        
+        # Get sample rows with all columns
+        cursor.execute('SELECT * FROM metadata LIMIT 5')
+        column_names = [desc[0] for desc in cursor.description]
+        sample_rows = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+        
+        # Get specific field diagnostics
+        field_stats = {}
+        for field in ['region', 'country', 'brand', 'project_name', 'website_url']:
+            cursor.execute(f'''
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN {field} IS NULL THEN 1 END) as null_count,
+                    COUNT(CASE WHEN {field} IS NOT NULL AND TRIM({field}) = '' THEN 1 END) as empty_count,
+                    COUNT(CASE WHEN {field} IS NOT NULL AND TRIM({field}) != '' THEN 1 END) as filled_count
+                FROM metadata
+            ''')
+            result = cursor.fetchone()
+            field_stats[field] = {
+                'total': result[0],
+                'null_count': result[1],
+                'empty_count': result[2],
+                'filled_count': result[3]
+            }
+        
+        release_pg_connection(conn)
+        
+        return jsonify({
+            'success': True,
+            'schema': schema,
+            'row_count': row_count,
+            'field_stats': field_stats,
+            'sample_rows': sample_rows
+        }), 200
+    
+    except Exception as e:
+        logger.error(f'[API] Error inspecting metadata: {str(e)}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/populate-regions', methods=['POST'])
+def populate_regions_endpoint():
+    """
+    Admin endpoint to populate region column from project_name field
+    Extracts region patterns like "(LATAM)" from project titles
+    Requires API key authentication
+    """
+    if not validate_api_key(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        logger.info('[API] Populating regions from project_name...')
+        result = db.populate_regions_from_project_name()
+        
+        logger.info(f'[API] Populate regions result: {result}')
+        return jsonify({
+            'success': True,
+            'result': result
+        }), 200
+    
+    except Exception as e:
+        logger.error(f'[API] Error populating regions: {str(e)}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/projects/<token>', methods=['GET'])
 def get_project_details(token: str):
     """

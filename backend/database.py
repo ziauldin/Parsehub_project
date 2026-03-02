@@ -2542,7 +2542,49 @@ class ParseHubDatabase:
             import traceback
             traceback.print_exc()
             return {'error': str(e)}
-            return []
+
+    def populate_regions_from_project_name(self) -> dict:
+        """
+        Populate empty region column by extracting from project_name field
+        Extracts pattern like "(LATAM)" from "Project Name (LATAM)"
+        Only updates records where region is NULL or empty
+        """
+        try:
+            if not is_postgres():
+                return {'error': 'Only available for PostgreSQL', 'updated': 0}
+            
+            conn = get_pg_connection()
+            cursor = conn.cursor()
+            
+            # Extract region from project_name and update empty region cells
+            # Pattern: looks for (REGION) at the end of project_name
+            update_sql = '''
+                UPDATE metadata
+                SET region = SUBSTRING(project_name FROM '\\(([A-Z]+)\\)$')
+                WHERE (region IS NULL OR TRIM(region) = '')
+                AND project_name IS NOT NULL
+                AND SUBSTRING(project_name FROM '\\(([A-Z]+)\\)$') IS NOT NULL
+                AND SUBSTRING(project_name FROM '\\(([A-Z]+)\\)$') != ''
+            '''
+            
+            cursor.execute(update_sql)
+            updated_count = cursor.rowcount
+            conn.commit()
+            
+            print(f"[DB] Updated {updated_count} region values from project_name")
+            release_pg_connection(conn)
+            
+            return {
+                'success': True,
+                'updated': updated_count,
+                'message': f'Updated {updated_count} region values from project_name field'
+            }
+            
+        except Exception as e:
+            print(f"[DB ERROR] Failed to populate regions: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'error': str(e), 'updated': 0}
 
     def get_projects_with_website_grouping(self, region: str = None, country: str = None,
                                            brand: str = None, website: str = None,
