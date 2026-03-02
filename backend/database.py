@@ -2398,8 +2398,24 @@ class ParseHubDatabase:
                 
                 print(f"[DB PG] {field}: total_non_null={count_total}, with_data={count_with_data}")
                 
+                # Special handling for region field - extract from project_name if empty
+                if field == 'region' and count_with_data == 0:
+                    print(f"[DB PG] Region field is empty, attempting to extract from project_name...")
+                    # Try to extract region from project_name (e.g., "Project Name (LATAM)" -> "LATAM")
+                    cursor.execute('''
+                        SELECT DISTINCT TRIM(SUBSTRING(project_name FROM '\\(([A-Z]+)\\)$')) as region
+                        FROM metadata
+                        WHERE project_name IS NOT NULL 
+                        AND SUBSTRING(project_name FROM '\\(([A-Z]+)\\)$') IS NOT NULL
+                        AND TRIM(SUBSTRING(project_name FROM '\\(([A-Z]+)\\)$')) != ''
+                        ORDER BY region
+                    ''')
+                    values = [str(row[0]).strip() for row in cursor.fetchall() if row and row[0]]
+                    print(f"[DB PG] Extracted {len(values)} regions from project_name: {values}")
+                    release_pg_connection(conn)
+                    return values
+                
                 # Query removes empty strings and NULLs, also trim whitespace
-                # Use COALESCE to handle NULL values
                 cursor.execute(
                     f"SELECT DISTINCT TRIM({field}) as val FROM metadata "
                     f"WHERE {field} IS NOT NULL AND TRIM({field}) != '' "
