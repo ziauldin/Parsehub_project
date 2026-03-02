@@ -2387,26 +2387,40 @@ class ParseHubDatabase:
                 conn = get_pg_connection()
                 cursor = conn.cursor()
                 
+                # Query removes empty strings and NULLs
                 cursor.execute(
-                    f"SELECT DISTINCT {field} FROM metadata WHERE {field} IS NOT NULL AND {field} != '' ORDER BY {field}")
-                values = [row[0] for row in cursor.fetchall()]
+                    f"SELECT DISTINCT {field} FROM metadata WHERE {field} IS NOT NULL AND TRIM({field}) != '' ORDER BY {field}")
+                values = [str(row[0]).strip() for row in cursor.fetchall() if row[0]]
                 
                 release_pg_connection(conn)
+                print(f"[DB] PostgreSQL query for {field} returned {len(values)} distinct values")
                 return values
             else:
                 # SQLite fallback
                 conn = self._get_connection()
                 cursor = conn.cursor()
 
+                # First, check if any data exists in the table
+                cursor.execute(f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL")
+                count_result = cursor.fetchone()
+                total_count = count_result[0] if count_result else 0
+                print(f"[DB] Total {field} records in metadata: {total_count}")
+
+                # Query removes empty strings and NULLs
                 cursor.execute(
                     f"SELECT DISTINCT {field} FROM metadata WHERE {field} IS NOT NULL AND {field} != '' ORDER BY {field}")
-                values = [row[0] for row in cursor.fetchall()]
+                rows = cursor.fetchall()
+                values = [str(row[0]).strip() for row in rows if row[0]]
+                
+                print(f"[DB] SQLite query for {field} returned {len(values)} distinct values: {values[:5] if values else 'NONE'}")
 
                 conn.close()
                 return values
 
         except Exception as e:
-            print(f"Error getting distinct metadata values for {field}: {e}")
+            print(f"[DB ERROR] Error getting distinct metadata values for {field}: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def get_distinct_project_websites(self) -> list:
@@ -2421,25 +2435,31 @@ class ParseHubDatabase:
             cursor = conn.cursor()
 
             cursor.execute(
-                'SELECT DISTINCT title FROM projects ORDER BY title')
+                'SELECT DISTINCT title FROM projects WHERE title IS NOT NULL ORDER BY title')
             rows = cursor.fetchall()
 
             websites = set()
             for row in rows:
-                title = row[0] if row[0] else "Unknown"
-                website = self.extract_website_from_title(title)
-                if website:
-                    websites.add(website)
+                if row and row[0]:
+                    title = str(row[0]).strip()
+                    website = self.extract_website_from_title(title)
+                    if website:
+                        websites.add(website)
 
             if is_postgres():
                 release_pg_connection(conn)
             else:
                 conn.close()
-                
-            return sorted(list(websites))
+            
+            result = sorted(list(websites))
+            print(f"[DB] Found {len(result)} distinct websites: {result[:5] if result else 'NONE'}")
+            return result
 
         except Exception as e:
-            print(f"Error getting project websites: {e}")
+            print(f"[DB ERROR] Error getting project websites: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
             return []
 
     def get_projects_with_website_grouping(self, region: str = None, country: str = None,
