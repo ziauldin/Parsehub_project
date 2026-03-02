@@ -1095,6 +1095,29 @@ def get_filters():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/diagnosis/metadata', methods=['GET'])
+def diagnose_metadata():
+    """
+    Diagnostic endpoint to check metadata column population in PostgreSQL
+    Shows which columns have data and sample values
+    """
+    if not validate_api_key(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        diagnosis = db.diagnose_metadata_columns()
+        logger.info(f'[API] Metadata diagnosis: {diagnosis}')
+        
+        return jsonify({
+            'success': True,
+            'diagnosis': diagnosis
+        }), 200
+    
+    except Exception as e:
+        logger.error(f'[API] Error diagnosing metadata: {str(e)}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/projects/<token>', methods=['GET'])
 def get_project_details(token: str):
     """

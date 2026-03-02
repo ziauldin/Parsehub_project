@@ -2387,13 +2387,28 @@ class ParseHubDatabase:
                 conn = get_pg_connection()
                 cursor = conn.cursor()
                 
-                # Query removes empty strings and NULLs
+                # First diagnostic: check how many records exist with data in this field
                 cursor.execute(
-                    f"SELECT DISTINCT {field} FROM metadata WHERE {field} IS NOT NULL AND TRIM({field}) != '' ORDER BY {field}")
-                values = [str(row[0]).strip() for row in cursor.fetchall() if row[0]]
+                    f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL")
+                count_total = cursor.fetchone()[0]
                 
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL AND TRIM(COALESCE({field}, '')) != ''")
+                count_with_data = cursor.fetchone()[0]
+                
+                print(f"[DB PG] {field}: total_non_null={count_total}, with_data={count_with_data}")
+                
+                # Query removes empty strings and NULLs, also trim whitespace
+                # Use COALESCE to handle NULL values
+                cursor.execute(
+                    f"SELECT DISTINCT TRIM({field}) as val FROM metadata "
+                    f"WHERE {field} IS NOT NULL AND TRIM({field}) != '' "
+                    f"ORDER BY val")
+                rows = cursor.fetchall()
+                values = [str(row[0]).strip() for row in rows if row and row[0]]
+                
+                print(f"[DB PG] {field} query returned {len(values)} distinct values: {values[:3] if values else 'NONE'}")
                 release_pg_connection(conn)
-                print(f"[DB] PostgreSQL query for {field} returned {len(values)} distinct values")
                 return values
             else:
                 # SQLite fallback
@@ -2402,9 +2417,12 @@ class ParseHubDatabase:
 
                 # First, check if any data exists in the table
                 cursor.execute(f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL")
-                count_result = cursor.fetchone()
-                total_count = count_result[0] if count_result else 0
-                print(f"[DB] Total {field} records in metadata: {total_count}")
+                count_total = cursor.fetchone()[0]
+                
+                cursor.execute(f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL AND {field} != ''")
+                count_with_data = cursor.fetchone()[0]
+                
+                print(f"[DB SQLite] {field}: total_non_null={count_total}, with_data={count_with_data}")
 
                 # Query removes empty strings and NULLs
                 cursor.execute(
@@ -2412,7 +2430,7 @@ class ParseHubDatabase:
                 rows = cursor.fetchall()
                 values = [str(row[0]).strip() for row in rows if row[0]]
                 
-                print(f"[DB] SQLite query for {field} returned {len(values)} distinct values: {values[:5] if values else 'NONE'}")
+                print(f"[DB SQLite] {field} query returned {len(values)} distinct values: {values[:3] if values else 'NONE'}")
 
                 conn.close()
                 return values
@@ -2452,7 +2470,7 @@ class ParseHubDatabase:
                 conn.close()
             
             result = sorted(list(websites))
-            print(f"[DB] Found {len(result)} distinct websites: {result[:5] if result else 'NONE'}")
+            print(f"[DB] Found {len(result)} distinct websites from {len(rows)} projects")
             return result
 
         except Exception as e:
@@ -2460,6 +2478,54 @@ class ParseHubDatabase:
             import traceback
             traceback.print_exc()
             return []
+
+    def diagnose_metadata_columns(self) -> dict:
+        """Diagnose which metadata columns have data (for PostgreSQL troubleshooting)"""
+        try:
+            if not is_postgres():
+                return {'error': 'Only available for PostgreSQL'}
+            
+            conn = get_pg_connection()
+            cursor = conn.cursor()
+            
+            diagnosis = {}
+            fields = ['region', 'country', 'brand', 'project_name', 'website_url']
+            
+            for field in fields:
+                # Count records
+                cursor.execute(f"SELECT COUNT(*) FROM metadata")
+                total = cursor.fetchone()[0]
+                
+                # Count with non-null values
+                cursor.execute(f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL")
+                non_null = cursor.fetchone()[0]
+                
+                # Count with non-empty trimmed values
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL AND TRIM({field}) != ''")
+                with_data = cursor.fetchone()[0]
+                
+                # Get sample values
+                cursor.execute(
+                    f"SELECT DISTINCT TRIM({field}) FROM metadata WHERE {field} IS NOT NULL AND TRIM({field}) != '' LIMIT 5")
+                samples = [row[0] for row in cursor.fetchall()]
+                
+                diagnosis[field] = {
+                    'total_records': total,
+                    'non_null': non_null,
+                    'with_data': with_data,
+                    'percentage': (with_data / total * 100) if total > 0 else 0,
+                    'samples': samples
+                }
+            
+            release_pg_connection(conn)
+            return diagnosis
+            
+        except Exception as e:
+            print(f"[DB ERROR] Diagnostic failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'error': str(e)}
             return []
 
     def get_projects_with_website_grouping(self, region: str = None, country: str = None,
